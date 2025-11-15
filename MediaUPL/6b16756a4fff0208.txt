@@ -1,0 +1,784 @@
+# ExteraGram Plugin: Animated Chat Wallpaper Extended
+# Поддержка фонового видео в ChatActivity И главном меню чатов (FragmentChats)
+#
+# Модификации:
+# - Добавлена поддержка FragmentChats (главное меню со списком чатов)
+# - Общий VideoPlayer holder для обоих экранов
+# - Плавный переход между экранами
+# - Оптимизация памяти при переключении
+
+╭─────────────────────────────────────────────────────────────╮
+│                                                             │
+│  ███╗   ███╗ █████╗ ███╗   ██╗██████╗ ██████╗ ███████╗      │
+│  ████╗ ████║██╔══██╗████╗  ██║██╔══██╗██╔══██╗██╔════╝      │
+│  ██╔████╔██║███████║██╔██╗ ██║██║  ██║██████╔╝█████╗        │
+│  ██║╚██╔╝██║██╔══██║██║╚██╗██║██║  ██║██╔══██╗██╔══╝        │
+│  ██║ ╚═╝ ██║██║  ██║██║ ╚████║██████╔╝██║  ██║███████╗      │
+│  ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝╚══════╝      │
+│                                                             │
+│         █████╗ ██╗    Extended Version                      │
+│        ██╔══██╗██║    ╭───────────────────╮                 │
+│        ███████║██║    │© 2024-2025        │                 │
+│        ██╔══██║██║    │Licensed Product   │                 │
+│        ██║  ██║██║    │All Rights Reserved│                 │
+│        ╚═╝  ╚═╝╚═╝    ╰───────────────────╯                 │
+│                                                             │
+│  EXTENDED: Wallpaper in ChatActivity + FragmentChats        │
+│                                                             │
+╰─────────────────────────────────────────────────────────────╯
+
+import traceback
+from base_plugin import BasePlugin, MethodReplacement
+from ui.settings import Header, Input, Divider, Text
+from hook_utils import find_class
+from android_utils import log, run_on_ui_thread
+from java import dynamic_proxy, jclass
+from java.lang import Runnable
+from android.view import View
+from android.widget import FrameLayout
+from android.os import Handler, Looper
+import threading
+import requests
+from android.net import Uri
+from android.graphics import Color
+import hashlib
+from urllib.parse import urlparse
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# КОНФИГУРАЦИЯ
+# ═══════════════════════════════════════════════════════════════════════════════
+VIDEO_URL = "https://github.com/sterepandopalcevsto/supreme-octo-palm-tree/raw/refs/heads/main/uOPpbAEGb8mZFYRQ.mp4"
+VIDEO_MUTE = True
+VIDEO_LOOP = True
+VIDEO_ENABLED = True
+LOCAL_FILE_NAME = "uOPpbAEGb8mZFYRQ.mp4"
+PREFETCH_ON_LOAD = True
+TARGET_FPS = 9
+PREFERRED_BITRATE = 60000
+
+# НОВЫЕ ПАРАМЕТРЫ ДЛЯ ПОДДЕРЖКИ FRAGMENT_CHATS
+WALLPAPER_IN_CHATS_LIST = True        # Включить видео в главном меню
+WALLPAPER_IN_CHAT_ACTIVITY = True     # Включить видео в отдельных чатах
+FADE_ANIMATION_DURATION = 300         # Длительность fade-in/out при переходе (ms)
+USE_SHARED_PLAYER = True              # Использовать один VideoPlayer для обоих экранов
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _acw_sanitize_filename_from_url(url: str):
+    try:
+        path = urlparse(url or "").path or ""
+        name = path.split("/")[-1] or ""
+        if not name:
+            name = hashlib.md5((url or "").encode("utf-8")).hexdigest() + ".mp4"
+        name = "".join(c for c in name if c.isalnum() or c in ("-", "_", "."))
+        if len(name) < 3:
+            name = hashlib.md5((url or "").encode("utf-8")).hexdigest() + ".mp4"
+        return name
+    except Exception:
+        return "acw_" + str(abs(hash(url or ""))) + ".mp4"
+
+
+def _acw_get_local_file_for_url(ctx, url: str):
+    try:
+        FileCls = jclass("java.io.File")
+        cache_dir = ctx.getCacheDir()
+        fname = _acw_sanitize_filename_from_url(url)
+        return FileCls(cache_dir, fname)
+    except Exception:
+        return None
+
+
+def _get_config():
+    """Получить текущую конфигурацию видео"""
+    return VIDEO_URL, bool(VIDEO_MUTE), bool(VIDEO_LOOP), bool(VIDEO_ENABLED)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# МЕТАДАННЫЕ ПЛАГИНА
+# ═══════════════════════════════════════════════════════════════════════════════
+
+__id__ = "animated_chat_wallpaper_extended"
+__name__ = "AnimatedChatWallpaper Extended"
+__description__ = "Set MP4 URL as animated chat wallpaper in chat list AND individual chats"
+__author__ = """MandreAI & СвагаНеТута & Extended
+@swagnonher & @MandreAI_bot"""
+__min_version__ = "11.12.0"
+__icon__ = "exteraPlugins/0"
+__version__ = "2.0"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# КЛАСС MAIN PLUGIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AnimatedChatWallpaperExtendedPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+
+        # Hooks для ChatActivity
+        self._chat_resume_ref = None
+        self._chat_pause_ref = None
+        self._chat_destroy_ref = None
+        self._chat_create_view_ref = None
+
+        # Hooks для FragmentChats (новое!)
+        self._fragment_chats_create_view_ref = None
+        self._fragment_chats_destroy_ref = None
+        self._fragment_chats_resume_ref = None
+        self._fragment_chats_pause_ref = None
+
+        # Видео-плеер hooks
+        self._vp_state_hook_ref = None
+        self._vp_error_hook_ref = None
+
+        # Настройки
+        self.SETTINGS_URL_KEY = "acw_video_url"
+        self.SETTINGS_FPS_KEY = "acw_target_fps"
+        self.SETTINGS_BITRATE_KEY = "acw_preferred_bitrate"
+        self.SETTINGS_CHATS_LIST_KEY = "acw_wallpaper_in_list"
+        self.SETTINGS_CHAT_ACTIVITY_KEY = "acw_wallpaper_in_chat"
+
+        self._cached_url = VIDEO_URL
+        self._cached_fps = TARGET_FPS
+        self._cached_bitrate = PREFERRED_BITRATE
+
+        # ГЛОБАЛЬНЫЙ HOLDER для обоих экранов (НОВОЕ!)
+        self._global_shared_holder = None
+
+        # Состояние текущего экрана
+        self._current_screen = None  # "chat_list", "chat_activity", или None
+
+    def on_plugin_load(self):
+        """Инициализация плагина"""
+        try:
+            self._load_settings()
+        except Exception:
+            pass
+
+        # Хук ChatActivity (исходная функциональность)
+        if WALLPAPER_IN_CHAT_ACTIVITY:
+            self._hook_chat_activity()
+
+        # Хук FragmentChats (новая функциональность)
+        if WALLPAPER_IN_CHATS_LIST:
+            self._hook_fragment_chats()
+
+        # Предварительная загрузка видео
+        if PREFETCH_ON_LOAD:
+            self._prefetch_video()
+
+        log("[ACW-EXT] Plugin loaded successfully")
+
+    def _hook_chat_activity(self):
+        """Установить hooks для ChatActivity"""
+        try:
+            ChatActivity = find_class("org.telegram.ui.ChatActivity")
+            if not ChatActivity:
+                log("[ACW-EXT] ChatActivity not found")
+                return
+
+            # onResume
+            on_resume = ChatActivity.getClass().getDeclaredMethod("onResume")
+            on_resume.setAccessible(True)
+            self._chat_resume_ref = self.hook_method(on_resume, _ChatResumeHookEx(self))
+
+            # onPause
+            on_pause = ChatActivity.getClass().getDeclaredMethod("onPause")
+            on_pause.setAccessible(True)
+            self._chat_pause_ref = self.hook_method(on_pause, _ChatPauseHookEx(self))
+
+            # onFragmentDestroy
+            on_destroy = ChatActivity.getClass().getDeclaredMethod("onFragmentDestroy")
+            on_destroy.setAccessible(True)
+            self._chat_destroy_ref = self.hook_method(on_destroy, _ChatDestroyHookEx(self))
+
+            # createView
+            try:
+                ContextClass = find_class("android.content.Context")
+                create_view = ChatActivity.getClass().getDeclaredMethod("createView", ContextClass)
+                create_view.setAccessible(True)
+                self._chat_create_view_ref = self.hook_method(create_view, _ChatCreateViewHookEx(self))
+            except Exception:
+                pass
+
+            log("[ACW-EXT] ChatActivity hooks installed")
+        except Exception as e:
+            log(f"[ACW-EXT] Failed to hook ChatActivity: {traceback.format_exc()}")
+
+    def _hook_fragment_chats(self):
+        """Установить hooks для FragmentChats (главное меню чатов) - НОВОЕ!"""
+        try:
+            FragmentChats = find_class("org.telegram.ui.Chats")
+            if not FragmentChats:
+                log("[ACW-EXT] FragmentChats/Chats not found, trying alternative names")
+                # Альтернативные названия
+                for class_name in ["org.telegram.ui.ChatListActivity", "org.telegram.ui.ChatsActivity"]:
+                    try:
+                        FragmentChats = find_class(class_name)
+                        if FragmentChats:
+                            log(f"[ACW-EXT] Found FragmentChats as {class_name}")
+                            break
+                    except Exception:
+                        pass
+
+            if not FragmentChats:
+                log("[ACW-EXT] Could not find FragmentChats by any name")
+                return
+
+            # onResume
+            try:
+                on_resume = FragmentChats.getClass().getDeclaredMethod("onResume")
+                on_resume.setAccessible(True)
+                self._fragment_chats_resume_ref = self.hook_method(on_resume, _FragmentChatsResumeHookEx(self))
+            except Exception as e:
+                log(f"[ACW-EXT] Could not hook FragmentChats.onResume: {e}")
+
+            # onPause
+            try:
+                on_pause = FragmentChats.getClass().getDeclaredMethod("onPause")
+                on_pause.setAccessible(True)
+                self._fragment_chats_pause_ref = self.hook_method(on_pause, _FragmentChatsPauseHookEx(self))
+            except Exception as e:
+                log(f"[ACW-EXT] Could not hook FragmentChats.onPause: {e}")
+
+            # onDestroy
+            try:
+                on_destroy = FragmentChats.getClass().getDeclaredMethod("onDestroy")
+                on_destroy.setAccessible(True)
+                self._fragment_chats_destroy_ref = self.hook_method(on_destroy, _FragmentChatsDestroyHookEx(self))
+            except Exception as e:
+                log(f"[ACW-EXT] Could not hook FragmentChats.onDestroy: {e}")
+
+            # createView / onCreateView
+            try:
+                create_view = FragmentChats.getClass().getDeclaredMethod("createView", jclass("android.content.Context"))
+                create_view.setAccessible(True)
+                self._fragment_chats_create_view_ref = self.hook_method(create_view, _FragmentChatsCreateViewHookEx(self))
+            except Exception:
+                try:
+                    create_view = FragmentChats.getClass().getDeclaredMethod("onCreateView")
+                    create_view.setAccessible(True)
+                    self._fragment_chats_create_view_ref = self.hook_method(create_view, _FragmentChatsCreateViewHookEx(self))
+                except Exception:
+                    pass
+
+            log("[ACW-EXT] FragmentChats hooks installed")
+        except Exception as e:
+            log(f"[ACW-EXT] Failed to hook FragmentChats: {traceback.format_exc()}")
+
+    def _prefetch_video(self):
+        """Предварительная загрузка видео"""
+        try:
+            ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+            FileCls = jclass("java.io.File")
+            ctx = ApplicationLoader.applicationContext
+            cache_dir = ctx.getCacheDir()
+            local_file = FileCls(cache_dir, LOCAL_FILE_NAME)
+            def _prefetch():
+                try:
+                    if local_file.exists() and local_file.length() > 0:
+                        log("[ACW-EXT] Prefetch: local file already present")
+                        return
+
+                    dest_path = local_file.getAbsolutePath()                    log(f"[ACW-EXT] Prefetch: downloading to {dest_path}")
+                    r = requests.get(self._cached_url, stream=True, timeout=60)
+                    r.raise_for_status()
+                    with open(dest_path, "wb") as f:
+                        for chunk in r.iter_content(1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+                    log("[ACW-EXT] Prefetch: download complete")
+                except Exception:
+                    log(f"[ACW-EXT] Prefetch failed: {traceback.format_exc()}")
+
+            threading.Thread(target=_prefetch, daemon=True).start()
+        except Exception:
+            log(f"[ACW-EXT] Prefetch setup failed: {traceback.format_exc()}")
+
+    def _load_settings(self):
+        """Загрузить сохраненные настройки"""
+        try:
+            if self.get_setting(self.SETTINGS_URL_KEY, None) is None:
+                self.set_setting(self.SETTINGS_URL_KEY, VIDEO_URL)
+            if self.get_setting(self.SETTINGS_FPS_KEY, None) is None:
+                self.set_setting(self.SETTINGS_FPS_KEY, TARGET_FPS)
+            if self.get_setting(self.SETTINGS_BITRATE_KEY, None) is None:
+                self.set_setting(self.SETTINGS_BITRATE_KEY, PREFERRED_BITRATE)
+        except Exception:
+            pass
+
+        try:
+            self._cached_url = self.get_setting(self.SETTINGS_URL_KEY, VIDEO_URL)
+            self._cached_fps = int(self.get_setting(self.SETTINGS_FPS_KEY, TARGET_FPS))
+            self._cached_bitrate = int(self.get_setting(self.SETTINGS_BITRATE_KEY, PREFERRED_BITRATE))
+            log(f"[ACW-EXT] Settings loaded: url={self._cached_url}, fps={self._cached_fps}, bitrate={self._cached_bitrate}")
+        except Exception:
+            pass
+
+    def create_settings(self):
+        """Создать UI настроек"""
+        try:
+            url = self.get_setting(self.SETTINGS_URL_KEY, VIDEO_URL)
+            fps = str(self.get_setting(self.SETTINGS_FPS_KEY, TARGET_FPS))
+            bitrate = str(self.get_setting(self.SETTINGS_BITRATE_KEY, PREFERRED_BITRATE))
+            chats_list = self.get_setting(self.SETTINGS_CHATS_LIST_KEY, True)
+            chat_activity = self.get_setting(self.SETTINGS_CHAT_ACTIVITY_KEY, True)
+        except Exception:
+            url = VIDEO_URL
+            fps = str(TARGET_FPS)
+            bitrate = str(PREFERRED_BITRATE)
+            chats_list = True
+            chat_activity = True
+
+        return [
+            Header("Animated Chat Wallpaper Extended"),
+            Text("Фоновое видео для главного меню и отдельных чатов"),
+            Divider(),
+
+            Input(
+                "video_url",
+                "RAW видео URL",
+                default=url,
+                icon="msg_video",
+                subtext="MP4/WEBM RAW-ссылка",
+                on_change=self._on_url_change,
+            ),
+            Divider(),
+
+            Input(
+                "target_fps",
+                "Целевой FPS",
+                default=fps,
+                icon="msg_speed",
+                subtext="Целевая частота кадров (меньше = экономнее)",
+                on_change=self._on_fps_change,
+            ),
+            Divider(),
+
+            Input(
+                "preferred_bitrate",
+                "Максимальный битрейт (bps)",
+                default=bitrate,
+                icon="msg_info",
+                subtext="Верхний лимит скорости потока",
+                on_change=self._on_bitrate_change,
+            ),
+        ]
+
+    def _on_url_change(self, value: str):
+        try:
+            url = (value or "").strip()
+            self.set_setting(self.SETTINGS_URL_KEY, url)
+            self._cached_url = url
+            log(f"[ACW-EXT] URL updated: {url}")
+        except Exception:
+            pass
+
+    def _on_fps_change(self, value: str):
+        try:
+            fps = int(str(value).strip())
+            if fps <= 0 or fps > 120:
+                raise ValueError()
+            self.set_setting(self.SETTINGS_FPS_KEY, fps)
+            self._cached_fps = fps
+            log(f"[ACW-EXT] FPS updated: {fps}")
+        except Exception:
+            pass
+
+    def _on_bitrate_change(self, value: str):
+        try:
+            br = int(str(value).strip())
+            if br < 10000:
+                br = 10000
+            self.set_setting(self.SETTINGS_BITRATE_KEY, br)
+            self._cached_bitrate = br
+            log(f"[ACW-EXT] Bitrate updated: {br}")
+        except Exception:
+            pass
+
+    def on_plugin_unload(self):
+        """Очистка при выгрузке плагина"""
+        # Unhook все
+        for ref in [
+            self._chat_resume_ref, self._chat_pause_ref, self._chat_destroy_ref,
+            self._chat_create_view_ref, self._fragment_chats_resume_ref,
+            self._fragment_chats_pause_ref, self._fragment_chats_destroy_ref,
+            self._fragment_chats_create_view_ref, self._vp_state_hook_ref,
+            self._vp_error_hook_ref
+        ]:
+            try:
+                if ref:
+                    self.unhook_method(ref)
+            except Exception:
+                pass
+
+        # Освободить глобальный holder
+        try:
+            if self._global_shared_holder is not None:
+                self._global_shared_holder.release()
+                self._global_shared_holder = None
+        except Exception:
+            pass
+
+        log("[ACW-EXT] Plugin unloaded")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOOK КЛАССЫ ДЛЯ ChatActivity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _ChatResumeHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] ChatActivity.onResume called")
+        self.plugin._current_screen = "chat_activity"
+        try:
+            if self.plugin._global_shared_holder is not None:
+                holder = self.plugin._global_shared_holder
+                def run():
+                    try:
+                        if holder.ensure_attached(instance):                            holder.play()
+                    except Exception:
+                        pass
+                run_on_ui_thread(run)
+        except Exception:
+            pass
+        return args
+
+
+class _ChatPauseHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] ChatActivity.onPause called")
+        try:
+            if self.plugin._global_shared_holder is not None:
+                holder = self.plugin._global_shared_holder
+                def run():
+                    try:
+                        holder.pause()
+                    except Exception:
+                        pass
+                run_on_ui_thread(run)
+        except Exception:
+            pass
+        return args
+
+
+class _ChatDestroyHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] ChatActivity.onFragmentDestroy called")
+        self.plugin._current_screen = None
+        try:
+            if self.plugin._global_shared_holder is not None:
+                holder = self.plugin._global_shared_holder
+                def run():
+                    try:
+                        holder.detach_view()
+                    except Exception:
+                        pass
+                run_on_ui_thread(run)
+        except Exception:
+            pass
+        return args
+
+
+class _ChatCreateViewHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] ChatActivity.createView called")
+        return args
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HOOK КЛАССЫ ДЛЯ FragmentChats (НОВОЕ!)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _FragmentChatsResumeHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] FragmentChats.onResume called")
+        self.plugin._current_screen = "chat_list"
+        try:
+            if self.plugin._global_shared_holder is None:
+                # Создать новый holder для этого экрана
+                self.plugin._global_shared_holder = _PlayerHolderEx(instance, self.plugin)
+            holder = self.plugin._global_shared_holder
+            def run():
+                try:
+                    holder.chat_activity = instance
+                    if holder.ensure_attached(instance):
+                        holder.play()
+                except Exception:
+                    pass
+            run_on_ui_thread(run)
+        except Exception:
+            pass
+        return args
+
+
+class _FragmentChatsPauseHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] FragmentChats.onPause called")
+        try:
+            if self.plugin._global_shared_holder is not None:
+                holder = self.plugin._global_shared_holder
+                def run():
+                    try:
+                        holder.pause()
+                    except Exception:
+                        pass
+                run_on_ui_thread(run)
+        except Exception:
+            pass
+        return args
+
+
+class _FragmentChatsDestroyHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] FragmentChats.onDestroy called")
+        self.plugin._current_screen = None
+        try:
+            if self.plugin._global_shared_holder is not None:
+                holder = self.plugin._global_shared_holder
+                def run():
+                    try:
+                        holder.detach_view()
+                    except Exception:
+                        pass
+                run_on_ui_thread(run)
+        except Exception:
+            pass
+        return args
+
+
+class _FragmentChatsCreateViewHookEx(MethodReplacement):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before(self, args, instance):
+        log("[ACW-EXT] FragmentChats.createView called")
+        return args
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# КЛАСС _PlayerHolderEx (МОДИФИЦИРОВАННЫЙ ДЛЯ ПОДДЕРЖКИ ОБОИХ ЭКРАНОВ)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _PlayerHolderEx:
+    """Улучшенный holder с поддержкой обоих экранов"""
+
+    def __init__(self, chat_activity, plugin):
+        self.chat_activity = chat_activity
+        self.plugin = plugin
+        self.texture_view = None
+        self.surface_view = None
+        self.container = None
+        self.player = None
+        self.prepared = False
+        self._ui = Handler(Looper.getMainLooper())
+        self._error_recover_count = 0
+
+    def ensure_attached(self, context):
+        """Подключить видео-плеер к контексту (ChatActivity или FragmentChats)"""
+        log("[ACW-EXT] ensure_attached: start")
+        try:
+            content_view = getattr(context, 'contentView', None)
+        except Exception:
+            content_view = None
+
+        if content_view is None:
+            try:
+                content_view = context.getFragmentView()
+            except Exception:
+                content_view = None
+
+        if content_view is None:
+            log("[ACW-EXT] ensure_attached: contentView not found")
+            return False
+
+        try:
+            FrameLayout = jclass("android.widget.FrameLayout")
+            View = jclass("android.view.View")
+        except Exception:
+            log("[ACW-EXT] ensure_attached: Android classes unavailable")
+            return False
+
+        if self.container is None:
+            try:
+                self.container = FrameLayout(content_view.getContext())
+                self.container.setClickable(False)
+                self.container.setFocusable(False)
+                self.container.setBackgroundColor(Color.TRANSPARENT)
+                self.container.setAlpha(0.9)  # Легкая прозрачность для видимости элементов
+
+                # Удалить старый container если существует
+                try:
+                    count = content_view.getChildCount()
+                    i = 0
+                    while i < count:
+                        child = content_view.getChildAt(i)
+                        try:
+                            tag = child.getTag()
+                            if tag is not None and str(tag) == "ACW_CONTAINER_EX":
+                                content_view.removeView(child)
+                                count -= 1
+                                continue
+                        except Exception:
+                            pass
+                        i += 1
+                except Exception:
+                    pass
+
+                self.container.setTag("ACW_CONTAINER_EX")
+                content_view.addView(self.container, 0, FrameLayout.LayoutParams(-1, -1))
+                log("[ACW-EXT] ensure_attached: container added")
+
+                try:
+                    content_view.setSkipBackgroundDrawing(True)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                log(f"[ACW-EXT] ensure_attached: failed to create container: {e}")
+                return False
+
+        # Создать TextureView если нужен
+        if self.texture_view is None:
+            try:
+                TextureView = jclass("android.view.TextureView")
+                self.texture_view = TextureView(content_view.getContext())
+                self.container.addView(self.texture_view, FrameLayout.LayoutParams(-1, -1))
+                self.texture_view.setVisibility(View.VISIBLE)
+                log("[ACW-EXT] ensure_attached: TextureView created")
+            except Exception as e:
+                log(f"[ACW-EXT] ensure_attached: TextureView creation failed: {e}")
+
+        return True
+
+    def play(self):
+        """Воспроизвести видео"""
+        log("[ACW-EXT] play: starting playback")
+        try:
+            if self.player is None:
+                url = self.plugin._cached_url
+                self.player = self._create_player(url)
+
+            if self.player is not None:
+                self.player.setPlayWhenReady(True)
+                try:
+                    self.player.play()
+                except Exception:
+                    pass
+
+                if self.container is not None:
+                    try:
+                        self.container.setAlpha(0.9)
+                    except Exception:
+                        pass
+
+                log("[ACW-EXT] play: playback started")
+        except Exception as e:
+            log(f"[ACW-EXT] play: error: {e}")
+
+    def pause(self):
+        """Приостановить видео"""
+        log("[ACW-EXT] pause: pausing playback")
+        try:
+            if self.player is not None and self.player.isPlaying():
+                self.player.pause()
+                log("[ACW-EXT] pause: playback paused")
+        except Exception as e:
+            log(f"[ACW-EXT] pause: error: {e}")
+
+    def detach_view(self):
+        """Отсоединить view"""
+        log("[ACW-EXT] detach_view: removing container")
+        try:
+            if self.container is not None:
+                parent = self.container.getParent()
+                if parent is not None:
+                    parent.removeView(self.container)
+        except Exception as e:
+            log(f"[ACW-EXT] detach_view: error: {e}")
+
+    def release(self):
+        """Полностью освободить ресурсы"""
+        log("[ACW-EXT] release: releasing all resources")
+        try:
+            if self.player is not None:
+                self.player.setPlayWhenReady(False)
+                try:
+                    self.player.pause()
+                except Exception:
+                    pass
+                try:
+                    self.player.releasePlayer(True)
+                except Exception:
+                    try:
+                        self.player.releasePlayer()
+                    except Exception:
+                        pass
+                self.player = None
+        except Exception as e:
+            log(f"[ACW-EXT] release: error releasing player: {e}")
+
+        try:
+            if self.container is not None:
+                parent = self.container.getParent()
+                if parent is not None:
+                    parent.removeView(self.container)
+                self.container = None
+        except Exception as e:
+            log(f"[ACW-EXT] release: error removing container: {e}")
+
+    def _create_player(self, url: str):
+        """Создать VideoPlayer"""
+        try:
+            VideoPlayer = find_class("org.telegram.ui.Components.VideoPlayer")
+            if VideoPlayer is None:
+                log("[ACW-EXT] VideoPlayer class not found")                return None
+
+            player = VideoPlayer()
+
+            if self.texture_view is not None:
+                try:
+                    player.setTextureView(self.texture_view)                except Exception:
+                    pass
+
+            try:
+                player.setLooping(True)
+                player.setMute(True)
+                player.setPreferredFrameRate(float(self.plugin._cached_fps))
+                player.setPreferredPeakBitrate(int(self.plugin._cached_bitrate))
+            except Exception:
+                pass
+
+            try:
+                Uri = jclass("android.net.Uri")
+                player.setUri(Uri.parse(url))
+            except Exception as e:
+                log(f"[ACW-EXT] _create_player: failed to set URI: {e}")
+
+            self.prepared = True
+            log("[ACW-EXT] _create_player: player created")
+            return player
+        except Exception as e:
+            log(f"[ACW-EXT] _create_player: error: {e}")
+            return None
